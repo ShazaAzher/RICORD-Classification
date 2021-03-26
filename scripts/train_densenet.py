@@ -5,19 +5,21 @@ from torchsummary import summary
 import numpy as np
 import pandas as pd
 from scipy.special import softmax
-from sklearn.metrics import roc_auc_score, accuracy_score
+from sklearn.metrics import accuracy_score
 import matplotlib.pyplot as plt
 from PIL import Image
 import pydicom
 import argparse
 import os
+import glob
 import sys
 from time import time
 import utils
 
 parser = argparse.ArgumentParser(description='Train a pretrained DenseNet on RICORD')
+parser.add_argument('train_subjects', type=str, help='Text file containing subject IDs for training')
+parser.add_argument('model_save_path', type=str, help='Path of folder where weights and history will be saved')
 parser.add_argument('--weights', default='all', type=str, help="Dataset pretrained on; one of 'all', 'rsna', 'nih', 'pc', 'chex', 'mimic_nb', 'mimic_ch'")
-parser.add_argument('--train_subjects', type=str, help='Text file containing subject IDs for training')
 parser.add_argument('--out_type', default='both', type=str, help="Which output heads to train; one of 'appear', 'grade', 'both'")
 parser.add_argument('--loss_param', default=0.5, type=float, help="Proportional of total loss that appearance classification contributes to; ignored if out_type not 'both'")
 parser.add_argument('--lr', default=0.001, type=float, help="Learning rate for Adam optimizer")
@@ -26,10 +28,8 @@ parser.add_argument('--k', default=1, type=int, help="Number of folds for cross-
 args = parser.parse_args()
 
 appear_mapping, grade_mapping = utils.get_label_mappings()
-im_height, im_width = 224, 224
-max_pixel_value = 4096 # (12-bit)
 annotation_filepath = '../data/final_annotations.csv'
-stacked_images_filepath = '../data/stacked_images_resized.npy'
+stacked_images_filepath = '../data/preprocessed_train_images.npy'
 
 train_subjs = open(args.train_subjects).read().splitlines()
 annots = pd.read_csv(annotation_filepath)
@@ -83,9 +83,12 @@ class Dataset(torch.utils.data.Dataset):
         return len(self.images)
 
 
-def train_model(weights, train_subjs, out_type, lr=0.001, a=0.5, k=1, num_epochs=100, batch_size=32):
+def train_model(weights, train_subjs, save_path, out_type, lr=0.001, a=0.5, k=1, num_epochs=100, batch_size=32, patience=10):
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     
     fold_subjs, num_ims_fold = utils.fold_split(annots, train_subjs, k)
+    phases = ['train', 'val'] if k > 1 else ['train']
     
     appear_loss_func = torch.nn.CrossEntropyLoss()
     grade_loss_func = torch.nn.CrossEntropyLoss(ignore_index=-1)
@@ -100,26 +103,33 @@ def train_model(weights, train_subjs, out_type, lr=0.001, a=0.5, k=1, num_epochs
     if out_type == 'appear': a = 1
     elif out_type == 'grade': a = 0
 
-    # init dict for storing metrics
-    history = {}
-    for metric in ['appear_acc', 'grade_acc', 'appear_auroc', 'grade_auroc', 'total_loss', 'appear_loss', 'grade_loss']:
-        history[metric] = {}
-        for phase in ['train', 'val']:
-            history[metric][phase] = [[] for _ in k]
-
+    # metrics to track
+    cols = ['appear_acc', 'appear_AP_c0', 'appear_AP_c1', 'appear_AP_c2', 'appear_AP_c3', 'appear_mAP',
+            'grade_acc', 'grade_AP_c0', 'grade_AP_c1', 'grade_AP_c2', 'grade_mAP',
+            'total_loss', 'appear_loss', 'grade_loss']
+    cols = ['epoch'] + ['train_' + col for col in cols] +  ['val_' + col for col in cols] + ['time']
 
     # for each fold in k-fold CV
     for i in range(k):
         
+        history = pd.DataFrame(columns = cols)
+        fold_path = os.path.join(save_path, 'fold_' + str(i+1))
+        if not os.path.exists(fold_path): os.mkdir(fold_path)
+        best_val_loss = float('inf')
+        num_epochs_no_imp = 0
+        stop_flag = False
+        
         # create data loaders
-        datasets['val'] = Dataset(fold_subjs[i])
-        data_loaders['val'] = torch.utils.data.DataLoader(datasets['val'], batch_size=batch_size, shuffle=False)
         datasets['train'] = Dataset(np.concatenate(np.delete(fold_subjs, i)))
         data_loaders['train'] = torch.utils.data.DataLoader(datasets['train'], batch_size=batch_size, shuffle=True)
+        if k > 1:
+            datasets['val'] = Dataset(fold_subjs[i])
+            data_loaders['val'] = torch.utils.data.DataLoader(datasets['val'], batch_size=batch_size, shuffle=False)
     
         # load model and optimizer
         model = Network(weights)
         model.freeze()
+        model = model.to(device)
         trainable_params = []
         if appear: trainable_params += list(model.appear_fc.parameters())
         if grade: trainable_params += list(model.grade_fc.parameters())
@@ -128,22 +138,32 @@ def train_model(weights, train_subjs, out_type, lr=0.001, a=0.5, k=1, num_epochs
         # iterate over epochs
         for epoch in range(num_epochs):
             
-            for phase in ['train', 'val']:
+            epoch_stats = {'epoch': epoch+1}
+            start_time = time()
+
+            for phase in phases:
                 
+                # set to train or eval mode
+                model.train(mode = (phase == 'train'))
+
                 # make buffers for output probabilities and targets, for epoch metric calculations
                 count = 0
                 running_total_loss = 0
                 running_appear_loss = 0
                 running_grade_loss = 0
                 if appear: 
-                    all_appear_prob = np.zeros(len(datasets[phase]), len(appear_mapping))
+                    all_appear_prob = np.zeros([len(datasets[phase]), len(appear_mapping)])
                     all_appear_targets = np.zeros(len(datasets[phase]))
                 if grade:
-                    all_grade_prob = np.zeros(len(datasets[phase]), len(grade_mapping))
+                    all_grade_prob = np.zeros([len(datasets[phase]), len(grade_mapping)])
                     all_grade_targets = np.zeros(len(datasets[phase]))
 
                 # iterate over batches
                 for images, appear_targets, grade_targets in data_loaders[phase]:
+
+                    images = images.to(device)
+                    if appear: appear_targets = appear_targets.to(device)
+                    if grade: grade_targets = grade_targets.to(device)
                     
                     optimizer.zero_grad()
                     
@@ -161,10 +181,10 @@ def train_model(weights, train_subjs, out_type, lr=0.001, a=0.5, k=1, num_epochs
                     
                     # store batch metrics
                     if appear:
-                        all_appear_prob[count: count + len(images), :] = softmax(appear_out, axis=1)
+                        all_appear_prob[count: count + len(images), :] = softmax(appear_out.detach().numpy(), axis=1)
                         all_appear_targets[count: count + len(images)] = appear_targets
                     if grade:
-                        all_grade_prob[count: count + len(images), :] = softmax(grade_out, axis=1)
+                        all_grade_prob[count: count + len(images), :] = softmax(grade_out.detach().numpy(), axis=1)
                         all_grade_targets[count: count + len(images)] = grade_targets
                     running_total_loss += loss.item() * len(images)
                     if appear: running_appear_loss += loss_appear.item() * len(images)
@@ -173,25 +193,54 @@ def train_model(weights, train_subjs, out_type, lr=0.001, a=0.5, k=1, num_epochs
 
                 # store epoch metrics
                 if appear:
-                    auroc = roc_auc_score(all_appear_targets, all_appear_prob)
-                    history['appear_auroc'][phase][i].append(auroc)
-                    _, all_appear_preds = np.max(all_appear_prob, 1)
+                    APs = utils.multiclass_AP(all_appear_targets, all_appear_prob)
+                    for i, ap in enumerate(APs):
+                        epoch_stats[phase + '_appear_AP_c' + str(i)] = ap
+                    epoch_stats[phase + '_appear_mAP'] = np.mean(APs)
+                    all_appear_preds = np.argmax(all_appear_prob, 1)
                     acc = accuracy_score(all_appear_targets, all_appear_preds)
-                    history['appear_acc'][phase][i].append(acc)
+                    epoch_stats[phase + '_appear_acc'] = acc
                 if grade:
                     # remove rows with no target grade label
                     no_target_ind = (all_grade_targets == -1)
                     all_grade_targets = np.delete(all_grade_targets, no_target_ind)
                     all_grade_prob = np.delete(all_appear_prob, no_target_ind, axis=0)
 
-                    auroc = roc_auc_score(all_grade_targets, all_grade_prob)
-                    history['grade_auroc'][phase][i].append(auroc)
-                    _, all_grade_preds = np.max(all_grade_prob, 1)
+                    APs = utils.multiclass_AP(all_grade_targets, all_grade_prob)
+                    for i, ap in enumerate(APs):
+                        epoch_stats[phase + '_grade_AP_c' + str(i)] = ap
+                    epoch_stats[phase + '_grade_mAP'] = np.mean(APs)
+                    all_grade_preds = np.argmax(all_grade_prob, 1)
                     acc = accuracy_score(all_grade_targets, all_grade_preds)
-                    history['grade_acc'][phase][i].append(acc)
-                history['total_loss'][phase][i].append(running_total_loss/len(datasets[phase]))
-                if appear: history['appear_loss'][phase][i].append(running_appear_loss/len(datasets[phase]))
-                if grade: history['grade_loss'][phase][i].append(running_grade_loss/len(datasets[phase]))
+                    epoch_stats[phase + '_grade_acc'] = acc
+                avg_loss = running_total_loss/len(datasets[phase])
+                epoch_stats[phase + '_total_loss'] = avg_loss
+                if appear: epoch_stats[phase + '_appear_loss'] = running_appear_loss/len(datasets[phase])
+                if grade: epoch_stats[phase + '_grade_loss'] = running_grade_loss/len(datasets[phase])
+
+                # model saving and early stopping
+                if phase == 'val':
+                    state = {'epoch': epoch+1, 'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict()}
+                    if epoch > 0: os.remove(glob.glob(os.path.join(fold_path, 'model_latest*'))[0])
+                    torch.save(state, os.path.join(fold_path, 'model_latest_ep{}_loss{:.2f}.pt'.format(epoch+1, avg_loss)))
+                    if avg_loss < best_val_loss:
+                        if epoch > 0: os.remove(glob.glob(os.path.join(fold_path, 'model_best*'))[0])
+                        torch.save(state, os.path.join(fold_path, 'model_best_ep{}_loss{:.2f}.pt'.format(epoch+1, avg_loss)))
+                        best_val_loss = avg_loss
+
+                    if avg_loss >= best_val_loss: 
+                        num_epochs_no_imp += 1
+                        if num_epochs_no_imp >= patience:
+                            print("STOPPING EARLY")
+                            stop_flag = True
+                    else: num_epochs_no_imp = 0
+                    
+            epoch_stats['time'] = time() - start_time
+            print(pd.DataFrame(epoch_stats, index=[0]))
+            history = history.append(epoch_stats, ignore_index=True)
+            history.to_csv(os.path.join(fold_path, 'history'))
+            if stop_flag: return
+        
 
 
-train_model(args.weights, train_subjs, args.out_type, k=args.k, lr=args.lr, a=args.loss_param, num_epochs=100)
+train_model(args.weights, train_subjs, args.model_save_path, args.out_type, k=args.k, lr=args.lr, a=args.loss_param, num_epochs=100)

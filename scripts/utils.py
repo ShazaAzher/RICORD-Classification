@@ -1,4 +1,5 @@
 import numpy as np
+from sklearn.metrics import average_precision_score
 
 def get_label_mappings():
     appear_mapping = {}
@@ -25,8 +26,13 @@ def fold_split(annots, train_subjs, k):
                 folds[i].append(subj)
                 num_ims[i] += num_im
                 break
-    print(num_ims)
+
     return folds, num_ims
+
+
+def multiclass_AP(targets, probs):
+    return [average_precision_score((targets==c), probs[:,c]) for c in range(probs.shape[1])]
+    
 
 
     
