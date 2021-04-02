@@ -4,7 +4,7 @@ import torchvision
 from torchsummary import summary
 import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, roc_auc_score
 import matplotlib.pyplot as plt
 from PIL import Image
 import pydicom
@@ -17,6 +17,7 @@ import utils
 
 pd.set_option('display.max_columns', None)
 pd.set_option('display.expand_frame_repr', False)
+np.random.seed(0)
 
 parser = argparse.ArgumentParser(description='Train a pretrained DenseNet on RICORD')
 parser.add_argument('train_subjects', type=str, help='Text file containing subject IDs for training')
@@ -25,18 +26,23 @@ parser.add_argument('--weights', default='all', type=str, help="Dataset pretrain
 parser.add_argument('--out_type', default='both', type=str, help="Which output heads to train; one of 'appear', 'grade', 'both'")
 parser.add_argument('--loss_param', default=0.5, type=float, help="Proportional of total loss that appearance classification contributes to; ignored if out_type not 'both'")
 parser.add_argument('--lr', default=0.001, type=float, help="Learning rate for Adam optimizer")
+parser.add_argument('--lr_factor', default=None, type=float, help="Steps down LR after 'patience' epochs without improvement")
 parser.add_argument('--batch_size', default=32, type=int, help="Size of minibatches")
 parser.add_argument('--k', default=1, type=int, help="Number of folds for cross-validation")
-parser.add_argument('--augment', default=False, type=bool, help="Whether to apply random transforms to training images")
+parser.add_argument('--rotation', default=None, type=float, help="Degrees of rotation as part of augmentation")
+parser.add_argument('--translation', default=None, type=float, help="Fraction of translation as part of augmentation")
+parser.add_argument('--scaling', default=None, type=float, help="Fraction of scaling as part of augmentation")
+parser.add_argument('--finetune_path', default=None, type=str, help="If path provided, will load and finetune model")
 args = parser.parse_args()
 
 appear_mapping, grade_mapping = utils.get_label_mappings()
 annotation_filepath = '../data/final_annotations.csv'
 stacked_images_filepath = '../data/preprocessed_train_images.npy'
 
-rotation = 45
-translation = 0.15
-scaling = 0.1
+augment = {}
+if args.rotation: augment['rotation'] = args.rotation
+if args.translation: augment['translation'] = args.translation
+if args.scaling: augment['scaling'] = args.scaling
 
 train_subjs = open(args.train_subjects).read().splitlines()
 annots = pd.read_csv(annotation_filepath)
@@ -57,7 +63,7 @@ class Network(torch.nn.Module):
     
     def forward(self, input, out_type):
         x = self.base_model(input)
-        
+
         if out_type == 'both':
             return self.appear_fc(x), self.grade_fc(x)
         elif out_type == 'appear':
@@ -76,15 +82,19 @@ class Network(torch.nn.Module):
             param.requires_grad = True
 
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self, subjs, augment=False):
+    def __init__(self, subjs, augment=None):
         
         split_annots = annots[annots['SubjectID'].isin(subjs)]
         self.appear_labels = [appear_mapping[label] for label in split_annots['AppearLabel']]
         self.grade_labels = [grade_mapping[label] if label in grade_mapping else -1 for label in split_annots['GradeLabel']]
         self.images = np.take(images, split_annots.index, axis=0)
-        self.transform = torchvision.transforms.Compose( \
-          [torchvision.transforms.RandomAffine(rotation,translate=(translation, translation),scale=(1-scaling, 1+scaling))]) \
-          if augment else None
+        if augment:
+          rotation = augment.get('rotation', 0)
+          translation = (augment['translation'], augment['translation']) if 'translation' in augment else None
+          scaling = (1-augment['scaling'], 1+augment['scaling']) if 'scaling' in augment else None
+          self.transform = torchvision.transforms.Compose( \
+            [torchvision.transforms.RandomAffine(rotation, translate=translation,scale=scaling)])
+        else: self.transform = None
         
     def __getitem__(self, index):
         image = torch.Tensor(self.images[index])
@@ -95,7 +105,8 @@ class Dataset(torch.utils.data.Dataset):
         return len(self.images)
 
 
-def train_model(weights, train_subjs, save_path, out_type, lr=0.001, a=0.5, k=1, num_epochs=100, batch_size=32, patience=10, augment=False):
+def train_model(weights, train_subjs, save_path, out_type, lr=0.001, lr_factor=None, 
+                a=0.5, k=1, num_epochs=100, batch_size=32, patience=10, augment=None, finetune_path=None):
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     
@@ -117,13 +128,13 @@ def train_model(weights, train_subjs, save_path, out_type, lr=0.001, a=0.5, k=1,
     elif out_type == 'grade': a = 0
 
     # metrics to track
-    cols = ['appear_acc', 'appear_AP_c0', 'appear_AP_c1', 'appear_AP_c2', 'appear_AP_c3', 'appear_mAP',
-            'grade_acc', 'grade_AP_c0', 'grade_AP_c1', 'grade_AP_c2', 'grade_mAP',
+    cols = ['appear_acc', 'appear_auroc', 'appear_AP_c0', 'appear_AP_c1', 'appear_AP_c2', 'appear_AP_c3', 'appear_mAP',
+            'grade_acc', 'grade_auroc', 'grade_AP_c0', 'grade_AP_c1', 'grade_AP_c2', 'grade_mAP',
             'total_loss', 'appear_loss', 'grade_loss']
     cols = ['epoch'] + ['train_' + col for col in cols] +  ['val_' + col for col in cols] + ['time']
-    print_metrics = ['epoch', 'train_appear_mAP', 'val_appear_mAP', 'train_grade_mAP', 'val_grade_mAP', 
-                     'train_appear_loss', 'train_grade_loss', 'train_total_loss',
-                     'val_appear_loss', 'val_grade_loss', 'val_total_loss']
+    print_metrics = ['epoch', 'train_total_loss', 'val_total_loss']
+    if appear: print_metrics += ['train_appear_mAP', 'val_appear_mAP', 'train_appear_loss','val_appear_loss']
+    if grade: print_metrics += ['train_grade_mAP', 'val_grade_mAP', 'train_grade_loss', 'val_grade_loss']
     fold_mAPs = {'train_appear': np.zeros(k), 'val_appear': np.zeros(k), 'train_grade': np.zeros(k), 'val_grade': np.zeros(k)}
 
     # for each fold in k-fold CV
@@ -136,7 +147,8 @@ def train_model(weights, train_subjs, save_path, out_type, lr=0.001, a=0.5, k=1,
         if not os.path.exists(fold_path): os.mkdir(fold_path)
         best_val_loss = float('inf')
         num_epochs_no_imp = 0
-        stop_flag = False
+        stop_flag = False # whether to terminate early
+        imp_on_lr = False # whether any improvement was seen with the current LR
         
         # create data loaders
         datasets['train'] = Dataset(np.concatenate(np.delete(fold_subjs, fold)), augment=augment)
@@ -202,12 +214,12 @@ def train_model(weights, train_subjs, save_path, out_type, lr=0.001, a=0.5, k=1,
                     if appear:
                         all_appear_prob[count: count + len(images), :] = softmax(appear_out.detach())
                         all_appear_targets[count: count + len(images)] = appear_targets
+                        running_appear_loss += loss_appear.item() * len(images)
                     if grade:
                         all_grade_prob[count: count + len(images), :] = softmax(grade_out.detach())
                         all_grade_targets[count: count + len(images)] = grade_targets
+                        running_grade_loss += loss_grade.item() * torch.sum((grade_targets != -1)).item()
                     running_total_loss += loss.item() * len(images)
-                    if appear: running_appear_loss += loss_appear.item() * len(images)
-                    if grade: running_grade_loss += loss_grade.item() * torch.sum((grade_targets != -1)).item()
                     count += len(images)
 
                 # store epoch metrics
@@ -218,6 +230,7 @@ def train_model(weights, train_subjs, save_path, out_type, lr=0.001, a=0.5, k=1,
                     for i, ap in enumerate(APs):
                         epoch_stats[phase + '_appear_AP_c' + str(i)] = ap
                     epoch_stats[phase + '_appear_mAP'] = np.mean(APs)
+                    epoch_stats[phase + '_appear_auroc'] = roc_auc_score(all_appear_targets, all_appear_prob, multi_class='ovr')
                     if avg_loss < best_val_loss: fold_mAPs[phase + '_appear'][fold] = np.mean(APs)  
                     all_appear_preds = np.argmax(all_appear_prob, 1)
                     acc = accuracy_score(all_appear_targets, all_appear_preds)
@@ -233,6 +246,7 @@ def train_model(weights, train_subjs, save_path, out_type, lr=0.001, a=0.5, k=1,
                     for i, ap in enumerate(APs):
                         epoch_stats[phase + '_grade_AP_c' + str(i)] = ap
                     epoch_stats[phase + '_grade_mAP'] = np.mean(APs)
+                    epoch_stats[phase + '_grade_auroc'] = roc_auc_score(all_grade_targets, all_grade_prob, multi_class='ovr')
                     if avg_loss < best_val_loss: fold_mAPs[phase + '_grade'][fold] = np.mean(APs) 
                     all_grade_preds = np.argmax(all_grade_prob, 1)
                     acc = accuracy_score(all_grade_targets, all_grade_preds)
@@ -240,7 +254,7 @@ def train_model(weights, train_subjs, save_path, out_type, lr=0.001, a=0.5, k=1,
                     epoch_stats[phase + '_grade_loss'] = running_grade_loss/torch.sum((all_grade_targets != -1)).item()
 
 
-                # model saving and early stopping
+                # model saving, LR stepping, and early stopping
                 if phase == 'val':
                     state = {'epoch': epoch+1, 'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict()}
                     if epoch > 0: os.remove(glob.glob(os.path.join(fold_path, 'model_latest*'))[0])
@@ -250,10 +264,17 @@ def train_model(weights, train_subjs, save_path, out_type, lr=0.001, a=0.5, k=1,
                         torch.save(state, os.path.join(fold_path, 'model_best_ep{}_loss{:.2f}.pt'.format(epoch+1, avg_loss)))
                         best_val_loss = avg_loss
                         num_epochs_no_imp = 0
+                        imp_on_lr = True
                     else:
                         num_epochs_no_imp += 1
                         if num_epochs_no_imp >= patience:
-                            stop_flag = True 
+                            if imp_on_lr and lr_factor:
+                                for g in optimizer.param_groups: g['lr'] *= lr_factor
+                                num_epochs_no_imp = 0
+                                imp_on_lr = False
+                                print("\nSTEPPING DOWN LR")
+                            else:
+                                stop_flag = True 
                     
             epoch_stats['time'] = time() - start_time
             print(pd.DataFrame(epoch_stats, index=[0])[print_metrics])
@@ -267,4 +288,6 @@ def train_model(weights, train_subjs, save_path, out_type, lr=0.001, a=0.5, k=1,
       print(metric, 'mAP:', np.mean(vals))    
 
 
-train_model(args.weights, train_subjs, args.model_save_path, args.out_type, k=args.k, lr=args.lr, a=args.loss_param, num_epochs=200, augment=args.augment)
+train_model(args.weights, train_subjs, args.model_save_path, args.out_type, k=args.k, 
+            lr=args.lr, lr_factor=args.lr_factor, a=args.loss_param, num_epochs=200, 
+            augment=augment, finetune_path=args.finetune_path)

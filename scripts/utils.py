@@ -15,16 +15,19 @@ def get_label_mappings():
     return appear_mapping, grade_mapping
 
 
-def fold_split(annots, train_subjs, k):
+def fold_split(annots, train_subjs, k, asgt_mode='random'):
     target_fold_size = len(annots)//k + 1
     folds = [[] for _ in range(k)]
     num_ims = np.zeros(k, dtype=int)
     for subj in train_subjs:
         num_im = len(annots[annots['SubjectID'] == subj])
-        for i in range(k):
-            if num_ims[i] < target_fold_size:
-                folds[i].append(subj)
-                num_ims[i] += num_im
+        fold_idxs = np.arange(k)
+        if asgt_mode == 'random': np.random.shuffle(fold_idxs)
+        
+        for idx in fold_idxs:
+            if num_ims[idx] < target_fold_size:
+                folds[idx].append(subj)
+                num_ims[idx] += num_im
                 break
 
     return folds, num_ims
