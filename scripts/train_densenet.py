@@ -32,6 +32,7 @@ parser.add_argument('--k', default=1, type=int, help="Number of folds for cross-
 parser.add_argument('--rotation', default=None, type=float, help="Degrees of rotation as part of augmentation")
 parser.add_argument('--translation', default=None, type=float, help="Fraction of translation as part of augmentation")
 parser.add_argument('--scaling', default=None, type=float, help="Fraction of scaling as part of augmentation")
+parser.add_argument('--dropout', default=None, type=float, help="Probability of dropout after the last convolutional layer")
 parser.add_argument('--finetune_path', default=None, type=str, help="If path provided, will load and finetune model")
 args = parser.parse_args()
 
@@ -52,9 +53,10 @@ annots = annots.reset_index(drop=True)
 images = np.load(stacked_images_filepath)
 
 class Network(torch.nn.Module):
-    def __init__(self, weights):
+    def __init__(self, weights='all', dropout_prob=0):
         super(Network, self).__init__()
         self.base_model = xrv.models.DenseNet(weights=weights)
+        self.dropout = torch.nn.Dropout(p=dropout_prob) if dropout_prob else None
         num_in = self.base_model.features.norm5.bias.shape[0]
         self.base_model.classifier = torch.nn.Identity() # remove pretrained FC layer
         self.base_model.op_threshs = None # turn off output normalization
@@ -63,6 +65,7 @@ class Network(torch.nn.Module):
     
     def forward(self, input, out_type):
         x = self.base_model(input)
+        if self.dropout: x = self.dropout(x)
 
         if out_type == 'both':
             return self.appear_fc(x), self.grade_fc(x)
@@ -78,8 +81,9 @@ class Network(torch.nn.Module):
             param.requires_grad = False
 
     def unfreeze(self):
-        for param in self.base_model.parameters():
-            param.requires_grad = True
+        for name, param in self.base_model.named_parameters():
+            if not 'norm' in name:
+              param.requires_grad = True
 
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, subjs, augment=None):
@@ -106,7 +110,8 @@ class Dataset(torch.utils.data.Dataset):
 
 
 def train_model(weights, train_subjs, save_path, out_type, lr=0.001, lr_factor=None, 
-                a=0.5, k=1, num_epochs=100, batch_size=32, patience=10, augment=None, finetune_path=None):
+                a=0.5, k=1, num_epochs=100, batch_size=32, patience=10, augment=None, 
+                dropout_prob=None, finetune_path=None):
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     
@@ -158,13 +163,26 @@ def train_model(weights, train_subjs, save_path, out_type, lr=0.001, lr_factor=N
             data_loaders['val'] = torch.utils.data.DataLoader(datasets['val'], batch_size=batch_size, shuffle=False)
     
         # load model and optimizer
-        model = Network(weights)
-        model.freeze()
+        if finetune_path:
+          finetune_fold_path = glob.glob(os.path.join(finetune_path, 'fold_'+str(k), '*best*'))[0]
+          print(os.path.join(finetune_path, 'fold_'+str(k), '*best*'))
+          checkpoint = torch.load(finetune_fold_path)
+          model = Network(dropout_prob=dropout_prob)
+          model.load_state_dict(checkpoint['state_dict'])
+          model.unfreeze()
+          trainable_params = [param for param in model.parameters() if param.requires_grad]
+          if appear: trainable_params += list(model.appear_fc.parameters())
+          if grade: trainable_params += list(model.grade_fc.parameters())
+          optimizer = torch.optim.Adam(trainable_params, lr=1e-5)
+        else:
+          model = Network(weights=weights, dropout_prob=dropout_prob)
+          model.freeze()
+          trainable_params = []
+          if appear: trainable_params += list(model.appear_fc.parameters())
+          if grade: trainable_params += list(model.grade_fc.parameters())
+          optimizer = torch.optim.Adam(trainable_params, lr=lr)
         model = model.to(device)
-        trainable_params = []
-        if appear: trainable_params += list(model.appear_fc.parameters())
-        if grade: trainable_params += list(model.grade_fc.parameters())
-        optimizer = torch.optim.Adam(trainable_params, lr=lr)
+        
 
         # iterate over epochs
         for epoch in range(num_epochs):
@@ -290,4 +308,4 @@ def train_model(weights, train_subjs, save_path, out_type, lr=0.001, lr_factor=N
 
 train_model(args.weights, train_subjs, args.model_save_path, args.out_type, k=args.k, 
             lr=args.lr, lr_factor=args.lr_factor, a=args.loss_param, num_epochs=200, 
-            augment=augment, finetune_path=args.finetune_path)
+            augment=augment, dropout_prob=args.dropout, finetune_path=args.finetune_path)
