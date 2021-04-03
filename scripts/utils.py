@@ -2,17 +2,18 @@ import numpy as np
 from sklearn.metrics import average_precision_score
 
 def get_label_mappings():
-    appear_mapping = {}
+    mappings = {}
+    mappings['appear'] = {}
     for line in open('../data/appear_labels.txt'):
         key, val = line.strip().split('\t')
-        appear_mapping[key] = int(val)
+        mappings['appear'][key] = int(val)
     
-    grade_mapping = {}
+    mappings['grade'] = {}
     for line in open('../data/grade_labels.txt'):
         key, val = line.strip().split('\t')
-        grade_mapping[key] = int(val)
+        mappings['grade'][key] = int(val)
 
-    return appear_mapping, grade_mapping
+    return mappings
 
 
 def fold_split(annots, train_subjs, k, asgt_mode='random'):
@@ -35,7 +36,4 @@ def fold_split(annots, train_subjs, k, asgt_mode='random'):
 
 def multiclass_AP(targets, probs):
     return [average_precision_score((targets==c), probs[:,c]) for c in range(probs.shape[1])]
-    
-
-
     
