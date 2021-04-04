@@ -19,4 +19,7 @@ print('Train appear mAP:', avg_best_metrics['train_appear_mAP'])
 print('Val appear mAP:', avg_best_metrics['val_appear_mAP'])
 print('Train grade mAP:', avg_best_metrics['train_grade_mAP'])
 print('Val grade mAP:', avg_best_metrics['val_grade_mAP'])
+
+print()
+print(all_best_metrics[['val_appear_mAP', 'val_grade_mAP']])
   

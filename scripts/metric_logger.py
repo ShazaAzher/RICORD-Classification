@@ -18,8 +18,8 @@ class Metric_Logger():
     if self.appear: self.print_metrics += ['train_appear_mAP', 'val_appear_mAP', 'train_appear_loss','val_appear_loss']
     if self.grade: self.print_metrics += ['train_grade_mAP', 'val_grade_mAP', 'train_grade_loss', 'val_grade_loss']
 
-  def init_fold(self, k):
-    self.k = k
+  def init_fold(self, fold):
+    self.fold = fold
     self.history = pd.DataFrame(columns = self.cols)
 
   def init_epoch(self, epoch):

@@ -1,5 +1,7 @@
 import numpy as np
 from sklearn.metrics import average_precision_score
+import pandas as pd
+import os
 
 def get_label_mappings():
     mappings = {}
@@ -36,4 +38,11 @@ def fold_split(annots, train_subjs, k, asgt_mode='random'):
 
 def multiclass_AP(targets, probs):
     return [average_precision_score((targets==c), probs[:,c]) for c in range(probs.shape[1])]
+
+def get_best_val_loss(finetune_path, fold):
+    history = pd.read_csv(os.path.join(finetune_path, 'fold_' + str(fold), 'history.csv'))
+    return history['val_total_loss'].min()
+    
+
+
     
