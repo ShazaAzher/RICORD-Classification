@@ -1,0 +1,3 @@
+Mild Opacities  (1-2 lung zones)	0
+Moderate Opacities (3-4 lung zones)	1
+Severe Opacities (>4 lung zones)	2

@@ -1,0 +1,4 @@
+Typical Appearance	0
+Indeterminate Appearance	1
+Atypical Appearance	2
+Negative for Pneumonia	3
