@@ -27,8 +27,8 @@ for subj_idx in subj_idxs:
 
 test_subj = pd.DataFrame(test_subj, columns=["Test Subject ID"])
 train_subj = pd.DataFrame(train_subj, columns=["Train Subject ID"])
-test_subj.to_csv("../data/test_subjects.csv")
-train_subj.to_csv("../data/train_subjects.csv")
+test_subj.to_csv("/data/test_subjects.csv")
+train_subj.to_csv("/data/train_subjects.csv")
 
 print("Test subjects:", num_test_subj)
 print("Test images:", num_test_curr)
