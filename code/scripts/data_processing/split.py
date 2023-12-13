@@ -3,7 +3,7 @@ import numpy as np
 
 TEST_PERCENT = 20
 
-annots = pd.read_csv('../data/final_annotations.csv')
+annots = pd.read_csv('data/final_annotations.csv')
 num_total = len(annots)
 num_test = int(num_total * 20/100)
 print(num_total)
